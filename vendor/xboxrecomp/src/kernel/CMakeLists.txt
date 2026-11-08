@@ -24,6 +24,8 @@ set(KERNEL_SOURCES
     icall_feedback.c
     recomp_trace.c
     recomp_continuation.c
+    mod_debug_log.c
+    mod_battle.c
     machine_checkpoint.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c

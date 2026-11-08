@@ -119,6 +119,64 @@ void xbox_InputInit(void)
     }
 }
 
+/* SMT NINE turn-based mod (kernel/mod_battle.c): button taps requested by
+ * the mod, packed 4 bits per tap, first tap in the low bits (1 = A, 2 = B,
+ * 3 = D-pad down, 4 = D-pad up). Each tap is held for 4 polls and released
+ * for 4, with a fresh packet number on each change so the game sees edges. */
+extern volatile long g_mod_taps;
+/* While the mod's item target picker is open the game gets no input; the
+ * picker reads the mapped buttons instead (1 up, 2 down, 4 left, 8 right,
+ * 16 A, 32 B), so the player's own bindings apply. */
+extern volatile long g_mod_input_capture, g_mod_captured_buttons;
+long mod_input_policy(void);   /* kernel/mod_battle.c */
+extern volatile long g_mod_user_buttons;
+static void mod_inject(DWORD port, XBOX_INPUT_STATE *state)
+{
+    static long phase, button; static DWORD packet = 0x40000000u;
+    if (port != 0) return;
+    if (g_mod_input_capture) {
+        long b = 0; const XBOX_GAMEPAD *g = &state->Gamepad;
+        if ((g->wButtons & XBOX_GAMEPAD_DPAD_UP) || g->sThumbLY > 16000) b |= 1;
+        if ((g->wButtons & XBOX_GAMEPAD_DPAD_DOWN) || g->sThumbLY < -16000) b |= 2;
+        if ((g->wButtons & XBOX_GAMEPAD_DPAD_LEFT) || g->sThumbLX < -16000) b |= 4;
+        if ((g->wButtons & XBOX_GAMEPAD_DPAD_RIGHT) || g->sThumbLX > 16000) b |= 8;
+        if (g->bAnalogButtons[XBOX_BUTTON_A] > 100) b |= 16;
+        if (g->bAnalogButtons[XBOX_BUTTON_B] > 100) b |= 32;
+        g_mod_captured_buttons = b;
+        memset(&state->Gamepad, 0, sizeof state->Gamepad);
+        state->dwPacketNumber = packet;
+        return;
+    }
+    g_mod_user_buttons = (state->Gamepad.bAnalogButtons[XBOX_BUTTON_X] > 100 ? 1 : 0) |
+                         (state->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] > 100 ? 2 : 0) |
+                         (state->Gamepad.bAnalogButtons[XBOX_BUTTON_B] > 100 ? 4 : 0);
+    long block = mod_input_policy();
+    if (block == 1) {                       /* only the mod's own taps */
+        memset(&state->Gamepad, 0, sizeof state->Gamepad);
+    } else if (block == 2) {                /* no B (the mod handles it) */
+        state->Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 0;
+    } else if (block == 4) {                /* no A, no B */
+        state->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 0;
+        state->Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 0;
+    }
+    if (!phase) {
+        long taps = g_mod_taps;
+        if (!taps) return;
+        button = taps & 15;
+        InterlockedCompareExchange(&g_mod_taps, (taps >> 4) & 0x0FFFFFFF, taps);
+        phase = 1;
+    }
+    if (phase <= 4) {
+        if (button == 1) state->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
+        else if (button == 2) state->Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 255;
+        else if (button == 3) state->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_DOWN;
+        else if (button == 4) state->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_UP;
+    }
+    if (phase == 1 || phase == 5) packet++;
+    state->dwPacketNumber = packet;
+    if (++phase > 8) phase = 0;
+}
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XINPUT_STATE xi_state;
@@ -138,6 +196,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         g_controller_connected[dwPort] = FALSE;
         if (dwPort == 0 && keyboard_enabled()) {
             keyboard_state(pState);
+            mod_inject(dwPort, pState);
             return ERROR_SUCCESS;
         }
         return result;
@@ -181,6 +240,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         pState->dwPacketNumber = kb.dwPacketNumber;
     }
 
+    mod_inject(dwPort, pState);
     return ERROR_SUCCESS;
 }
 

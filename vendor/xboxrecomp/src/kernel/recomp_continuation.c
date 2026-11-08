@@ -52,8 +52,28 @@ static void discard_recovery(SavedFrame *frames, uint32_t count) {
     }
     free(frames);
 }
+volatile uint32_t *volatile g_recomp_trace_counts;
+void recomp_mod_guest_printf(void);
+void recomp_mod_battle_update(void);
+void recomp_mod_battle_menu(void);
+void recomp_mod_battle_hook(uint32_t function);
+void recomp_mod_event(uint32_t function, uint32_t count);
+extern FILE *volatile g_mod_event_log;
 uint64_t recomp_cont_enter(RecompContFrame *f, uint32_t function,
                           const RecompContLocal *locals, size_t count) {
+    {
+        volatile uint32_t *counts=g_recomp_trace_counts;
+        uint32_t index=function-RECOMP_TRACE_BASE;
+        if (counts && index<RECOMP_TRACE_SPAN) {
+            uint32_t seen=++counts[index];
+            if (seen<=32 && g_mod_event_log) recomp_mod_event(function,seen); /* battle timeline */
+        }
+        if (function==0x0014BA4Bu) recomp_mod_guest_printf(); /* SMT NINE debug print */
+        else if (function==0x0018BA1Fu) recomp_mod_battle_update(); /* SMT NINE battle update */
+        else if (function==0x0019396Eu || function==0x00191824u) recomp_mod_battle_menu(); /* battle command menu */
+        else if (function==0x00168904u || function==0x001715E9u || function==0x0016C065u || function==0x0016F6C1u || function==0x0017203Au || function==0x0018FB13u ||
+                 function==0x0018F5E1u || function==0x00193842u || function==0x001941AAu || function==0x0010A324u) recomp_mod_battle_hook(function); /* battle script */
+    }
     f->function=function; f->site=0;
     f->locals=locals; f->local_count=count; f->parent=head; f->jumps=0; f->on_leave=0; f->on_unwind=0; f->retained=0; head=f;
     if (recovery) {

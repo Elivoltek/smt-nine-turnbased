@@ -1,4 +1,20 @@
-# SMT NINE Recomp
+# SMT NINE – Turn-Based Edition (English)
+
+**Shin Megami Tensei NINE on PC, in English, with traditional SMT turn-based battles.**
+
+1. Download this project and unpack it (25 GB free space needed).
+2. Double-click **`SMT NINE Turn-Based.cmd`** → **Install / Patch my game...** → select your own Japanese SMT NINE ISO.
+3. Wait for **Done!**, then click **Play**.
+
+No game data is included – you need your own unmodified Japanese disc image. English comes from the [SMT NINE English patch](https://github.com/negative-entrophy/smt-nine-english-patch) by negative-entrophy, which the installer downloads from its official release.
+
+**[How to install and play, battle controls, known issues → docs/TURN_BASED.md](docs/TURN_BASED.md)**
+
+This edition is a fork of [smt-nine-recomp](https://github.com/gymzatan/smt-nine-recomp) by gymzatan. The original project's README follows below.
+
+---
+
+## SMT NINE Recomp (original README)
 
 A native Windows port of **Shin Megami Tensei NINE** for the original Xbox, built with [xboxrecomp](https://github.com/sp00nznet/xboxrecomp). Game code is statically translated from your Japanese retail disc and compiled locally. The default build provides Japanese; the project's Chinese translation is optional. Config can import an ISO that you have separately patched with an English translation, with or without Chinese support.
 

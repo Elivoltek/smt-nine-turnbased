@@ -13,6 +13,106 @@
 #include <stdlib.h>
 #include <string.h>
 #include "kernel/kernel.h"
+#include "kernel/recomp_continuation.h"
+#include "kernel/xbox_memory_layout.h"
+#include <xinput.h>
+#include "mod_icons.h"
+extern FILE *volatile g_recomp_mod_log;
+extern FILE *volatile g_mod_battle_recorder;
+extern FILE *volatile g_mod_event_log;
+extern volatile long g_mod_battle_frames,g_mod_battle_frozen,g_mod_battle_turn,g_mod_battle_turn_pause,g_mod_battle_phase;
+static volatile LONG s_turn_mode_key,s_mod_key;
+extern volatile long g_mod_guided,g_mod_enemy_turns,g_mod_last_extra;
+extern volatile uint32_t g_mod_pad_state;
+extern volatile long g_mod_debug;
+extern volatile long g_mod_pt_player,g_mod_pt_enemy,g_mod_pt_show,g_mod_message_seq,g_mod_input_capture,g_mod_single_items;
+extern char g_mod_message[160];
+extern volatile long g_mod_pick_active,g_mod_pick_count,g_mod_pick_choice,g_mod_pick_seq,g_mod_pick_hp[5],g_mod_pick_mp[5];
+extern char g_mod_pick_name[5][24];
+static HFONT mod_font(int height,int weight){
+    return CreateFontW(-height,0,0,0,weight,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
+        NONANTIALIASED_QUALITY,DEFAULT_PITCH|FF_SWISS,L"Arial");
+}
+
+/* Press-turn bar (battle mod): purple icons = your side's actions left,
+ * pink icons = the enemy's. Counts come from kernel/mod_battle.c. */
+static long s_pt_drawn_player=-1,s_pt_drawn_enemy=-1;
+static void mod_draw_icons(HDC dc,int x,int y,const unsigned int *icon,long count){
+    BITMAPINFO info;memset(&info,0,sizeof info);
+    info.bmiHeader.biSize=sizeof info.bmiHeader;info.bmiHeader.biWidth=MOD_ICON_W;info.bmiHeader.biHeight=-MOD_ICON_H;
+    info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;
+    for(long i=0;i<count;i++)SetDIBitsToDevice(dc,x+(int)i*(MOD_ICON_W+2),y,MOD_ICON_W,MOD_ICON_H,0,0,0,MOD_ICON_H,icon,&info,DIB_RGB_COLORS);
+}
+static LRESULT CALLBACK mod_turns_proc(HWND h,UINT m,WPARAM w,LPARAM l){
+    if(m==WM_ERASEBKGND)return 1;
+    if(m==WM_PAINT){
+        PAINTSTRUCT ps;HDC dc=BeginPaint(h,&ps);RECT r;GetClientRect(h,&r);
+        HBRUSH brush=CreateSolidBrush(MOD_BAR_BG);FillRect(dc,&r,brush);DeleteObject(brush);
+        static HFONT bold;if(!bold)bold=mod_font(14,FW_BOLD);
+        HGDIOBJ font=SelectObject(dc,bold);SetBkMode(dc,TRANSPARENT);
+        long player=g_mod_pt_player,enemy=g_mod_pt_enemy;
+        SetTextColor(dc,RGB(200,170,255));TextOutW(dc,4,9,L"YOU",3);
+        SetTextColor(dc,RGB(255,150,200));TextOutW(dc,4,MOD_ICON_H+13,L"ENEMY",5);
+        mod_draw_icons(dc,52,2,s_mod_icon_purple,player);
+        mod_draw_icons(dc,52,MOD_ICON_H+6,s_mod_icon_pink,enemy);
+        SelectObject(dc,font);EndPaint(h,&ps);
+        s_pt_drawn_player=player;s_pt_drawn_enemy=enemy;return 0;
+    }
+    return DefWindowProcW(h,m,w,l);
+}
+/* Item target panel, drawn like the game's own option boxes: one framed
+ * navy box per member, the chosen one gold. Black is the window's color key
+ * (the gaps between boxes are see-through) and the whole panel is slightly
+ * transparent. */
+#define MOD_PICK_W 360
+#define MOD_PICK_ROW 34
+#define MOD_PICK_TOP 38
+static void mod_box(HDC dc,RECT r,COLORREF top,COLORREF bottom,COLORREF edge){
+    int h=r.bottom-r.top;if(h<1)h=1;
+    for(int y=0;y<h;y+=2){
+        int t=y*255/h;
+        COLORREF c=RGB((GetRValue(top)*(255-t)+GetRValue(bottom)*t)/255,(GetGValue(top)*(255-t)+GetGValue(bottom)*t)/255,(GetBValue(top)*(255-t)+GetBValue(bottom)*t)/255);
+        RECT band={r.left,r.top+y,r.right,r.top+y+2>r.bottom?r.bottom:r.top+y+2};
+        HBRUSH b=CreateSolidBrush(c);FillRect(dc,&band,b);DeleteObject(b);
+    }
+    HBRUSH e=CreateSolidBrush(edge);FrameRect(dc,&r,e);
+    RECT inner={r.left+1,r.top+1,r.right-1,r.bottom-1};FrameRect(dc,&inner,e);DeleteObject(e);
+}
+static LRESULT CALLBACK mod_pick_proc(HWND h,UINT m,WPARAM w,LPARAM l){
+    if(m==WM_ERASEBKGND)return 1;
+    if(m==WM_PAINT){
+        PAINTSTRUCT ps;HDC dc=BeginPaint(h,&ps);RECT r;GetClientRect(h,&r);
+        static HFONT big,small;if(!big){big=mod_font(19,FW_BOLD);small=mod_font(14,FW_BOLD);}
+        HBRUSH key=CreateSolidBrush(RGB(0,0,0));FillRect(dc,&r,key);DeleteObject(key);
+        HGDIOBJ font=SelectObject(dc,big);SetBkMode(dc,TRANSPARENT);
+        RECT head={20,2,r.right-20,MOD_PICK_TOP-6};
+        mod_box(dc,head,RGB(52,74,120),RGB(24,36,70),RGB(150,190,235));
+        SetTextColor(dc,RGB(235,240,255));
+        {const wchar_t *t=L"Use item on";RECT tr=head;DrawTextW(dc,t,-1,&tr,DT_CENTER|DT_VCENTER|DT_SINGLELINE);}
+        long count=g_mod_pick_count,choice=g_mod_pick_choice;if(count>5)count=5;
+        for(long i=0;i<count;i++){
+            RECT row={4,MOD_PICK_TOP+(int)i*MOD_PICK_ROW,r.right-4,MOD_PICK_TOP+(int)i*MOD_PICK_ROW+MOD_PICK_ROW-4};
+            if(i==choice)mod_box(dc,row,RGB(150,130,40),RGB(95,80,20),RGB(245,225,120));
+            else mod_box(dc,row,RGB(40,58,104),RGB(18,28,62),RGB(110,150,205));
+            wchar_t text[96];
+            swprintf_s(text,96,L"%hs",g_mod_pick_name[i]);
+            SelectObject(dc,big);SetTextColor(dc,RGB(250,250,250));
+            TextOutW(dc,row.left+14,row.top+5,text,(int)wcslen(text));
+            SelectObject(dc,small);
+            swprintf_s(text,96,L"Hp %ld",g_mod_pick_hp[i]);
+            SetTextColor(dc,RGB(120,240,120));TextOutW(dc,row.left+190,row.top+8,text,(int)wcslen(text));
+            swprintf_s(text,96,L"Mp %ld",g_mod_pick_mp[i]);
+            SetTextColor(dc,RGB(140,170,255));TextOutW(dc,row.left+270,row.top+8,text,(int)wcslen(text));
+        }
+        RECT foot={20,MOD_PICK_TOP+(int)count*MOD_PICK_ROW,r.right-20,r.bottom-2};
+        mod_box(dc,foot,RGB(30,44,80),RGB(16,24,52),RGB(110,150,205));
+        SelectObject(dc,small);SetTextColor(dc,RGB(200,215,235));
+        {const wchar_t *t=L"Up/Down: choose    A: use    B: back";RECT tr=foot;DrawTextW(dc,t,-1,&tr,DT_CENTER|DT_VCENTER|DT_SINGLELINE);}
+        SelectObject(dc,font);EndPaint(h,&ps);return 0;
+    }
+    return DefWindowProcW(h,m,w,l);
+}
+static volatile LONG s_wait_key;
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern int xbox_VideoIsPlaying(void);
@@ -26,7 +126,7 @@ static ULONGLONG s_checkpoint_notice_until;
 static wchar_t s_screenshot_directory[MAX_PATH];
 static unsigned s_ui_language;
 static int s_paused,s_fullscreen;
-static LONG s_pause_command,s_screenshot_command;
+static LONG s_pause_command,s_screenshot_command,s_trace_command;
 static WINDOWPLACEMENT s_window_placement={sizeof(WINDOWPLACEMENT)};
 static LONG_PTR s_window_style,s_window_exstyle;
 void xbox_FramebufferWindowSetControls(const wchar_t *directory,unsigned language) {
@@ -355,6 +455,22 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        if(m==WM_KEYDOWN && (w=='G' || w=='N' || w=='H' || w=='D')) {
+            if(!(l & (1L<<30)))InterlockedExchange(&s_mod_key,(LONG)w);
+            return 0;
+        }
+        if(m==WM_KEYDOWN && w=='T') {
+            if(!(l & (1L<<30)))InterlockedExchange(&s_turn_mode_key,1);
+            return 0;
+        }
+        if(m==WM_KEYDOWN && w=='P') {
+            if(!(l & (1L<<30)))InterlockedExchange(&s_wait_key,1);
+            return 0;
+        }
+        if(m==WM_KEYDOWN && (w==VK_F6 || w==VK_F7)) {
+            if(!(l & (1L<<30)))InterlockedExchange(&s_trace_command,w==VK_F6?1:2);
+            return 0;
+        }
         if(m==WM_KEYDOWN && (w==VK_F8 || w==VK_F9)) {
             if(!(l & (1L<<30))) {
                 if(w==VK_F8)InterlockedExchange(&s_screenshot_command,1);
@@ -496,6 +612,130 @@ static void fb_screenshot(void) {
     else {swprintf_s(notice,512,L"%ls%ls",fb_text(3),path);fb_notice(notice);}
 }
 
+/* Mod research trace (F6/F7), written to runtime/Trace beside Screenshots.
+ * F6: the first press starts counting guest function entries; each later
+ *     press saves the counts since the previous press as segment_NNN.txt.
+ * F7: saves the 64 MB guest RAM as memory_NNN.bin for locating battle data. */
+static int fb_trace_directory(wchar_t *out) {
+    wcsncpy_s(out,MAX_PATH,s_screenshot_directory,_TRUNCATE);
+    wchar_t *a=wcsrchr(out,L'/'),*b=wcsrchr(out,L'\\'),*cut=a>b?a:b;
+    if(!out[0] || !cut)return 0;
+    cut[1]=0;
+    if(wcscat_s(out,MAX_PATH,L"Trace"))return 0;
+    return CreateDirectoryW(out,NULL) || GetLastError()==ERROR_ALREADY_EXISTS;
+}
+static void fb_trace_segment(void) {
+    static unsigned segment;static volatile uint32_t *spare;
+    wchar_t directory[MAX_PATH],path[MAX_PATH],notice[512];
+    if(!spare) {
+        spare=(volatile uint32_t *)VirtualAlloc(NULL,(SIZE_T)RECOMP_TRACE_SPAN*4,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+        if(!spare){fb_notice(L"Trace: out of memory");return;}
+    }
+    volatile uint32_t *old=(volatile uint32_t *)InterlockedExchangePointer((PVOID volatile *)&g_recomp_trace_counts,(PVOID)spare);
+    spare=NULL;
+    if(!old) {
+        spare=(volatile uint32_t *)VirtualAlloc(NULL,(SIZE_T)RECOMP_TRACE_SPAN*4,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+        if(fb_trace_directory(directory)) {
+            swprintf_s(path,MAX_PATH,L"%ls/game_log_%lu.txt",directory,GetCurrentProcessId());
+            FILE *log=_wfopen(path,L"wb");
+            if(log){setvbuf(log,NULL,_IOFBF,1<<16);fputs("# trace started\n",log);g_recomp_mod_log=log;}
+            swprintf_s(path,MAX_PATH,L"%ls/battle_rec_%lu.bin",directory,GetCurrentProcessId());
+            FILE *recorder=_wfopen(path,L"wb");
+            if(recorder){setvbuf(recorder,NULL,_IOFBF,1<<20);g_mod_battle_recorder=recorder;}
+            swprintf_s(path,MAX_PATH,L"%ls/battle_events_%lu.bin",directory,GetCurrentProcessId());
+            FILE *events=_wfopen(path,L"wb");
+            if(events){setvbuf(events,NULL,_IOFBF,1<<18);g_mod_event_log=events;}
+        }
+        fb_notice(L"Trace started (F6 = save segment, F7 = save memory)");
+        fprintf(stderr,"[TRACE] started\n");fflush(stderr);return;
+    }
+    Sleep(50); /* let in-flight increments on the old table finish */
+    if(!fb_trace_directory(directory)){fb_notice(L"Trace: cannot create runtime/Trace");spare=old;return;}
+    ++segment;
+    swprintf_s(path,MAX_PATH,L"%ls/segment_%03u_%lu.txt",directory,segment,GetCurrentProcessId());
+    FILE *file=_wfopen(path,L"w");unsigned functions=0;
+    if(file) {
+        SYSTEMTIME t;GetLocalTime(&t);
+        fprintf(file,"# segment %u %02u:%02u:%02u.%03u\n",segment,t.wHour,t.wMinute,t.wSecond,t.wMilliseconds);
+        for(uint32_t i=0;i<RECOMP_TRACE_SPAN;i++) if(old[i]) {
+            fprintf(file,"%08X %u\n",RECOMP_TRACE_BASE+i,(unsigned)old[i]);functions++;
+        }
+        if(fclose(file))file=NULL;
+    }
+    memset((void *)old,0,(size_t)RECOMP_TRACE_SPAN*4);spare=old;
+    if(g_recomp_mod_log){fprintf(g_recomp_mod_log,"# ---- F6 segment %u saved ----\n",segment);fflush(g_recomp_mod_log);}
+    if(!file){fb_notice(L"Trace: segment could not be saved");return;}
+    swprintf_s(notice,512,L"Trace segment %u saved (%u functions)",segment,functions);fb_notice(notice);
+    fprintf(stderr,"[TRACE] segment %u functions=%u\n",segment,functions);fflush(stderr);
+}
+static void fb_trace_memory(void) {
+    static unsigned snapshot;
+    wchar_t directory[MAX_PATH],path[MAX_PATH],notice[512];
+    if(!fb_trace_directory(directory)){fb_notice(L"Trace: cannot create runtime/Trace");return;}
+    ++snapshot;
+    swprintf_s(path,MAX_PATH,L"%ls/memory_%03u_%lu.bin",directory,snapshot,GetCurrentProcessId());
+    HANDLE file=CreateFileW(path,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+    if(file==INVALID_HANDLE_VALUE){fb_notice(L"Trace: memory could not be saved");return;}
+    static unsigned char zero[0x10000];int ok=1;
+    size_t total=g_xbox_total_ram?g_xbox_total_ram:XBOX_TOTAL_RAM;
+    for(size_t at=0;at<total && ok;at+=0x10000) {
+        const void *source=(const void *)((uintptr_t)(uint32_t)at+xbox_GetMemoryOffset());DWORD written=0;
+        if(IsBadReadPtr(source,0x10000))source=zero;
+        if(!WriteFile(file,source,0x10000,&written,NULL) || written!=0x10000) {
+            if(!WriteFile(file,zero,0x10000,&written,NULL) || written!=0x10000)ok=0;
+        }
+    }
+    if(!CloseHandle(file))ok=0;
+    if(!ok){DeleteFileW(path);fb_notice(L"Trace: memory could not be saved");return;}
+    swprintf_s(notice,512,L"Memory snapshot %u saved",snapshot);fb_notice(notice);
+    if(g_recomp_mod_log){fprintf(g_recomp_mod_log,"# ---- F7 memory %u saved ----\n",snapshot);fflush(g_recomp_mod_log);}
+    fprintf(stderr,"[TRACE] memory %u\n",snapshot);fflush(stderr);
+}
+
+/* Turn-based mod step 1: battle wait toggle (see kernel/mod_battle.c).
+ * Toggle with P, or with both analog triggers fully pressed (GameCube L+R). */
+static ULONGLONG s_mod_battle_seen;
+static void fb_mod_battle_poll(HWND window) {
+    static int connected=-1,was_combo;static ULONGLONG next_scan,last_seen,last_notice;static long last_frames;
+    ULONGLONG now=GetTickCount64();XINPUT_STATE state;uint32_t pad=0;int combo=0;
+    if(connected<0 && now>=next_scan) {
+        for(DWORD i=0;i<4;i++){ZeroMemory(&state,sizeof state);if(XInputGetState(i,&state)==ERROR_SUCCESS){connected=(int)i;break;}}
+        next_scan=now+2000;
+    }
+    if(connected>=0) {
+        ZeroMemory(&state,sizeof state);
+        if(XInputGetState((DWORD)connected,&state)!=ERROR_SUCCESS)connected=-1;
+        else {
+            pad=state.Gamepad.wButtons|((uint32_t)state.Gamepad.bLeftTrigger<<16)|((uint32_t)state.Gamepad.bRightTrigger<<24);
+            combo=state.Gamepad.bLeftTrigger>200 && state.Gamepad.bRightTrigger>200;
+        }
+    }
+    g_mod_pad_state=pad;
+    if(GetForegroundWindow()!=window)combo=0;
+    long frames=g_mod_battle_frames;
+    if(frames!=last_frames){last_frames=frames;last_seen=now;}
+    s_mod_battle_seen=last_seen;
+    {static long seq;long now_seq=g_mod_message_seq;static ULONGLONG repeat;
+     if(now_seq!=seq||(g_mod_input_capture&&now>repeat)){
+        wchar_t text[160];MultiByteToWideChar(CP_UTF8,0,g_mod_message,-1,text,160);text[159]=0;
+        fb_notice(text);seq=now_seq;repeat=now+3000;last_notice=now;}}
+    int in_battle=last_seen && now-last_seen<1500;
+    if(!in_battle && g_mod_battle_frozen)InterlockedExchange(&g_mod_battle_frozen,0);
+    int toggle=(combo && !was_combo) | (int)InterlockedExchange(&s_wait_key,0);
+    was_combo=combo;
+    if(toggle) {
+        if(!in_battle)fb_notice(L"Battle wait works only during a battle");
+        else {
+            LONG frozen=!g_mod_battle_frozen;InterlockedExchange(&g_mod_battle_frozen,frozen);
+            fb_notice(frozen?L"BATTLE PAUSED - set commands, then L+R (or P) to continue":L"Battle continues");
+            last_notice=now;
+            fprintf(stderr,"[MOD] battle wait %d\n",(int)frozen);fflush(stderr);
+        }
+    } else if(g_mod_battle_frozen && !g_mod_input_capture && now-last_notice>3000) {
+        {wchar_t text[200];if(g_mod_battle_phase)swprintf_s(text,200,L"TURN %ld - YOUR PARTY: pick an action for each member (Guard = pass). The turn starts after the last one.",g_mod_battle_turn+1);else wcscpy_s(text,200,L"BATTLE PAUSED - L+R (or P) to continue");fb_notice(text);}last_notice=now;
+    }
+}
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     HWND hwnd,notice_window=NULL;
@@ -534,10 +774,24 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         return 0;
     }
     if(s_native_renderer) {
-        notice_window=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|SS_LEFT|SS_ENDELLIPSIS,
+        /* An owned popup, not a child: in borderless fullscreen the swap
+         * chain is shown directly and child windows disappear behind it. */
+        notice_window=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,L"STATIC",L"",WS_POPUP|SS_LEFT|SS_ENDELLIPSIS,
             0,0,1,1,hwnd,NULL,GetModuleHandleW(NULL),NULL);
         if(!notice_window){fprintf(stderr,"[STOP] display notice window failed\n");exit(5);}
         SendMessageW(notice_window,WM_SETFONT,(WPARAM)GetStockObject(DEFAULT_GUI_FONT),FALSE);
+    }
+    HWND turns_window=NULL,pick_window=NULL;
+    {
+        WNDCLASSW tc;memset(&tc,0,sizeof tc);
+        tc.lpfnWndProc=mod_turns_proc;tc.hInstance=GetModuleHandleW(NULL);tc.lpszClassName=L"ModPressTurns";
+        RegisterClassW(&tc);
+        /* Layered with black as the color key: the bar has no background. */
+        turns_window=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED,L"ModPressTurns",L"",WS_POPUP,0,0,1,1,hwnd,NULL,GetModuleHandleW(NULL),NULL);
+        if(turns_window)SetLayeredWindowAttributes(turns_window,RGB(0,0,0),0,LWA_COLORKEY);
+        tc.lpfnWndProc=mod_pick_proc;tc.lpszClassName=L"ModItemTarget";RegisterClassW(&tc);
+        pick_window=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED,L"ModItemTarget",L"",WS_POPUP,0,0,1,1,hwnd,NULL,GetModuleHandleW(NULL),NULL);
+        if(pick_window)SetLayeredWindowAttributes(pick_window,RGB(0,0,0),225,LWA_COLORKEY|LWA_ALPHA);
     }
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     hdc = GetDC(hwnd);
@@ -566,16 +820,46 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         }
         if(!s_paused)xbox_CheckpointDeviceEnter(XBOX_CHECKPOINT_FRAMEBUFFER);
         RECT display=fb_display_bounds(hwnd),client;GetClientRect(hwnd,&client);
+        if(turns_window){
+            static int shown;static POINT placed;
+            int want=g_mod_pt_show && GetTickCount64()-s_mod_battle_seen<1500 && !IsIconic(hwnd) && GetForegroundWindow()==hwnd;
+            if(want){
+                int width=52+10*(MOD_ICON_W+2)+4,height=2*MOD_ICON_H+10;
+                POINT at={display.left+8,display.top+8};ClientToScreen(hwnd,&at);
+                if(!shown||placed.x!=at.x||placed.y!=at.y){
+                    SetWindowPos(turns_window,HWND_TOP,at.x,at.y,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+                    placed=at;shown=1;InvalidateRect(turns_window,NULL,FALSE);
+                }
+                static ULONGLONG repaint;ULONGLONG tick=GetTickCount64();
+                if(g_mod_pt_player!=s_pt_drawn_player||g_mod_pt_enemy!=s_pt_drawn_enemy||tick>repaint){
+                    SetWindowPos(turns_window,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+                    InvalidateRect(turns_window,NULL,FALSE);repaint=tick+250;}
+            } else if(shown){ShowWindow(turns_window,SW_HIDE);shown=0;}
+        }
+        if(pick_window){
+            static int shown;static long drawn=-1;
+            int want=g_mod_pick_active && !IsIconic(hwnd) && GetForegroundWindow()==hwnd;
+            if(want){
+                long count=g_mod_pick_count;if(count>5)count=5;if(count<1)count=1;
+                int height=MOD_PICK_TOP+(int)count*MOD_PICK_ROW+30;
+                POINT at={display.left+(display.right-display.left)/2-MOD_PICK_W/2,display.top+(display.bottom-display.top)/2-height/2};
+                ClientToScreen(hwnd,&at);
+                if(!shown){SetWindowPos(pick_window,HWND_TOP,at.x,at.y,MOD_PICK_W,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);shown=1;drawn=-1;}
+                if(g_mod_pick_seq!=drawn){drawn=g_mod_pick_seq;
+                    SetWindowPos(pick_window,HWND_TOP,at.x,at.y,MOD_PICK_W,height,SWP_NOACTIVATE);InvalidateRect(pick_window,NULL,FALSE);}
+            } else if(shown){ShowWindow(pick_window,SW_HIDE);shown=0;}
+        }
         if(s_native_renderer) {
             int32_t bounds[4]={display.left,display.top,display.right,display.bottom};
             if(s_native_pending) {
                 s_native_pending=0;
                 if(!s_native_renderer->display(hwnd,client.right,client.bottom,bounds))s_native_pending=1;
             }
-            int show=s_paused || (s_checkpoint_notice[0] && GetTickCount64()<s_checkpoint_notice_until);
+            int show=(s_paused || (s_checkpoint_notice[0] && GetTickCount64()<s_checkpoint_notice_until)) && !IsIconic(hwnd) && GetForegroundWindow()==hwnd;
             if(show) {
                 SetWindowTextW(notice_window,GetTickCount64()<s_checkpoint_notice_until?s_checkpoint_notice:fb_text(0));
-                SetWindowPos(notice_window,HWND_TOP,display.left+8,display.bottom-28,
+                POINT at={display.left+8,display.bottom-28};ClientToScreen(hwnd,&at);
+                SetWindowPos(notice_window,HWND_TOP,at.x,at.y,
                     display.right-display.left>16?display.right-display.left-16:1,20,SWP_NOACTIVATE|SWP_SHOWWINDOW);
             } else ShowWindow(notice_window,SW_HIDE);
         } else {
@@ -668,11 +952,27 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                            (long)s_frame_draws,s_paused?L" | F9: paused":L"");
                 tb[127] = 0;
                 SetWindowTextW(hwnd, tb);
+                if(g_recomp_mod_log)fflush(g_recomp_mod_log);
+                if(g_mod_battle_recorder)fflush(g_mod_battle_recorder);
+                if(g_mod_event_log)fflush(g_mod_event_log);
                 t0 = now; f0 = f;
             }
         }
         if(!s_paused)xbox_CheckpointDeviceLeave(XBOX_CHECKPOINT_FRAMEBUFFER);
         if(InterlockedExchange(&s_screenshot_command,0))fb_screenshot();
+        {LONG trace=InterlockedExchange(&s_trace_command,0);if(trace==1)fb_trace_segment();else if(trace==2)fb_trace_memory();}
+        if(InterlockedExchange(&s_turn_mode_key,0)) {
+            LONG on=!g_mod_battle_turn_pause;InterlockedExchange(&g_mod_battle_turn_pause,on);
+            if(!on)InterlockedExchange(&g_mod_battle_frozen,0);
+            fb_notice(on?L"Turn-based mode ON (T to switch off)":L"Turn-based mode OFF - original real-time battles (T to switch on)");
+        }
+        {LONG key=InterlockedExchange(&s_mod_key,0);
+         if(key=='G'){LONG on=!g_mod_guided;InterlockedExchange(&g_mod_guided,on);fb_notice(on?L"Auto start ON - closing the battle menu starts the turn (G)":L"Auto start OFF - start the turn with L+R (G)");}
+         else if(key=='D'){LONG on=!g_mod_debug;InterlockedExchange(&g_mod_debug,on);fb_notice(on?L"Debug line ON (D)":L"Debug line OFF (D)");}
+         else if(key=='H'){LONG on=!g_mod_single_items;InterlockedExchange(&g_mod_single_items,on);fb_notice(on?L"Items: choose one party member (H)":L"Items: whole party as in the original (H)");}
+         else if(key=='N'){LONG on=!g_mod_enemy_turns;InterlockedExchange(&g_mod_enemy_turns,on);fb_notice(on?L"Enemy press turns ON (N)":L"Enemy press turns OFF - one action per enemy (N)");}}
+        {static long shown;long extra=g_mod_last_extra;if(extra&&extra!=shown){wchar_t text[120];swprintf_s(text,120,L"ENEMY PRESS TURNS: +%ld extra action%ls",extra,extra==1?L"":L"s");fb_notice(text);}shown=extra;}
+        fb_mod_battle_poll(hwnd);
         if(InterlockedExchange(&s_pause_command,0)) {
             if(s_paused) {xbox_CheckpointEnd();s_paused=0;fb_notice(fb_text(1));}
             else if(xbox_CheckpointBegin(3000)) {s_paused=1;memset((void *)s_key_down,0,sizeof s_key_down);fb_notice(fb_text(0));}

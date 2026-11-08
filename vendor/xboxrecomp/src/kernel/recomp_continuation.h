@@ -24,6 +24,12 @@ typedef struct RecompContFrame {
 
 uint64_t recomp_cont_enter(RecompContFrame *, uint32_t,
                           const RecompContLocal *, size_t);
+
+/* Mod research trace: per-function entry counters, off until the first F6.
+ * Index is (guest function address - RECOMP_TRACE_BASE). */
+#define RECOMP_TRACE_BASE 0x00010000u
+#define RECOMP_TRACE_SPAN 0x00700000u
+extern volatile uint32_t *volatile g_recomp_trace_counts;
 void recomp_cont_leave(RecompContFrame *);
 void recomp_cont_site(RecompContFrame *, uint64_t);
 void recomp_cont_invalid(void);

@@ -1195,7 +1195,19 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
 void recomp_call_profile_hit(uint32_t va);
 #define RECOMP_ABI_CALL(va, fn) do { RECOMP_BEFORE_CALL(va); recomp_call_profile_hit(va); (fn)(); } while(0)
 #else
-#define RECOMP_ABI_CALL(va, fn) do { RECOMP_BEFORE_CALL(va); (fn)(); } while(0)
+/* SMT NINE turn-based mod (vendor/xboxrecomp/src/kernel/mod_battle.c): calls
+ * the mod can hold back at runtime. g_mod_battle_skip bit 1 skips the
+ * per-unit battle update 0x001C22B9 (thiscall, ret 16 -> pops 20); bit 2
+ * skips the battle script interpreter 0x00169C74 (cdecl, ret -> pops 4), so
+ * the battle waits on its current script step while units, menus and
+ * drawing keep running. For every other call site the test is a
+ * compile-time zero. */
+extern volatile long g_mod_battle_skip;
+#define RECOMP_MOD_SKIP_BIT(va) ((uint32_t)(va)==0x001C22B9u ? 1 : (uint32_t)(va)==0x00169C74u ? 2 : 0)
+#define RECOMP_MOD_SKIP_POP(va) ((uint32_t)(va)==0x001C22B9u ? 20u : 4u)
+#define RECOMP_ABI_CALL(va, fn) do { RECOMP_BEFORE_CALL(va); \
+    if (RECOMP_MOD_SKIP_BIT(va) && (g_mod_battle_skip & RECOMP_MOD_SKIP_BIT(va))) g_esp += RECOMP_MOD_SKIP_POP(va); \
+    else (fn)(); } while(0)
 #endif
 
 /* A guarded arm of an indirect call. When a recorded run saw a call site
